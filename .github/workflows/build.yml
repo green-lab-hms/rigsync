@@ -1,0 +1,65 @@
+# Tests rigsync.py on Windows and builds it into a standalone RigSync.exe (no Python needed on the rig PC).
+# Every push: the exe is under the run's Artifacts. A version tag (git tag v1.0 && git push --tags): the exe is
+# also attached to a GitHub Release, downloadable from the repository's Releases page.
+name: Build RigSync
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to create releases for tags
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyinstaller==6.10.0 zstandard==0.23.0
+      - name: Tests
+        run: python tests/test_rigsync.py
+      - run: pyinstaller --onefile --noconsole --name RigSync --hidden-import zstandard rigsync.py
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $env:RIGSYNC_HOME = "$env:RUNNER_TEMP\rigsync"
+          $src = "$env:RUNNER_TEMP\src\JG0\260101\session_1"
+          New-Item -ItemType Directory -Force $src, "$env:RUNNER_TEMP\dst", $env:RIGSYNC_HOME | Out-Null
+          Set-Content "$src\a.tif" "test"
+          (Get-Item "$src\a.tif").LastWriteTime = (Get-Date).AddHours(-1)
+          @{ ci = @{ source = "$env:RUNNER_TEMP\src"; dest = "$env:RUNNER_TEMP\dst" } } | ConvertTo-Json | Set-Content "$env:RIGSYNC_HOME\profiles.json"
+          $p = Start-Process dist\RigSync.exe -ArgumentList '--run', 'ci' -Wait -PassThru
+          Get-Content "$env:RIGSYNC_HOME\logs\ci.log"
+          if ($p.ExitCode -ne 0 -or -not (Test-Path "$env:RUNNER_TEMP\dst\JG0\260101\session_1\a.tif")) { exit 1 }
+      - name: Scheduled task test
+        shell: pwsh
+        run: |
+          $env:RIGSYNC_HOME = "$env:RUNNER_TEMP\rigsync"
+          @{ ci = @{ source = "$env:RUNNER_TEMP\src"; dest = "$env:RUNNER_TEMP\dst"; run_at = "06:30, 22:00" } } | ConvertTo-Json | Set-Content "$env:RIGSYNC_HOME\profiles.json"
+          $p = Start-Process dist\RigSync.exe -ArgumentList '--schedule', 'ci' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RIGSYNC_HOME\logs\ci.log"; exit 1 }
+          $t = Get-ScheduledTask -TaskPath '\RigSync\' -TaskName 'ci'
+          $t.Triggers | Format-List StartBoundary, DaysInterval
+          $t.Settings | Format-List StartWhenAvailable, ExecutionTimeLimit, MultipleInstances
+          $t.Actions | Format-List Execute, Arguments
+          $times = $t.Triggers | ForEach-Object { ([datetime]$_.StartBoundary).ToString('HH:mm') }
+          if (($times -join ',') -ne '06:30,22:00' -or -not $t.Settings.StartWhenAvailable -or $t.Settings.ExecutionTimeLimit -ne 'PT0S') { exit 1 }
+          $p = Start-Process dist\RigSync.exe -ArgumentList '--unschedule', 'ci' -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or (Get-ScheduledTask -TaskPath '\RigSync\' -TaskName 'ci' -ErrorAction SilentlyContinue)) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RigSync
+          path: |
+            dist/RigSync.exe
+            README.md
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RigSync.exe
